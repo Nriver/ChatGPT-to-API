@@ -2,10 +2,11 @@ package main
 
 import (
 	"bufio"
+	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"os"
 	"os/exec"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -13,8 +14,6 @@ import (
 	"freechatgpt/internal/tokens"
 
 	"github.com/xqdoo00o/OpenAIAuth/auth"
-
-	"github.com/golang-jwt/jwt/v5"
 )
 
 var accounts []Account
@@ -28,21 +27,25 @@ type Account struct {
 	Password string `json:"password"`
 }
 
-type Claim struct {
-	jwt.RegisteredClaims
+type TokenExp struct {
+	Exp int64 `json:"exp"`
+	Iat int64 `json:"iat"`
 }
 
-func getTokenExpire(tokenstring string) (*jwt.NumericDate, error) {
-	t, _ := jwt.ParseWithClaims(tokenstring, &Claim{}, func(token *jwt.Token) (interface{}, error) {
-		return []byte(""), nil
-	})
-	issue, _ := t.Claims.GetExpirationTime()
-
-	if issue != nil {
-		return issue, nil
-	} else {
-		return nil, errors.New("invalid token")
+func getTokenExpire(tokenstring string) (time.Time, error) {
+	payLoadData := strings.Split(tokenstring, ".")[1]
+	// Decode payload
+	payload, err := base64.StdEncoding.DecodeString(payLoadData)
+	if err != nil {
+		return time.Time{}, err
 	}
+	// Unmarshal payload
+	var tokenExp TokenExp
+	err = json.Unmarshal(payload, &tokenExp)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return time.Unix(tokenExp.Exp, 0), nil
 }
 
 func AppendIfNone(slice []string, i string) []string {
@@ -122,15 +125,39 @@ func scheduleTokenPUID() {
 				if token == "" {
 					updateSingleToken(account, nil, true)
 				} else {
+					var toPUIDExpire time.Duration
+					var puidTime time.Time
 					var toExpire time.Duration
-					nowTime := time.Now()
+					if token_list[account.Email].PUID != "" {
+						re := regexp.MustCompile(`\d{10,}`)
+						puidIat := re.FindString(token_list[account.Email].PUID)
+						if puidIat != "" {
+							puidIatInt, _ := strconv.ParseInt(puidIat, 10, 64)
+							puidTime = time.Unix(puidIatInt, 0)
+							toPUIDExpire = interval - time.Since(puidTime)
+							if toPUIDExpire < 0 {
+								updateSingleToken(account, nil, false)
+							}
+						}
+					}
+				tokenProcess:
+					token, _ = ACCESS_TOKENS.GetSecret(account.Email)
 					expireTime, err := getTokenExpire(token)
+					nowTime := time.Now()
 					if err != nil {
 						toExpire = interval - nowTime.Sub(stat.ModTime())
 					} else {
 						toExpire = expireTime.Sub(nowTime)
 						if toExpire > 0 {
 							toExpire = toExpire % interval
+						}
+					}
+					if toPUIDExpire > 0 {
+						toPUIDExpire = interval - nowTime.Sub(puidTime)
+						if toPUIDExpire < toExpire {
+							updateSingleToken(account, nil, false)
+							toPUIDExpire = 0
+							goto tokenProcess
 						}
 					}
 					if toExpire > 0 {
